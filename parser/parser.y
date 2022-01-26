@@ -3803,6 +3803,22 @@ IndexHintListOpt:
 		$$ = $1
 	}
 
+/*
+joined_table: {
+    table_reference {[INNER | CROSS] JOIN | STRAIGHT_JOIN} table_factor [join_specification]
+  | table_reference {LEFT|RIGHT} [OUTER] JOIN table_reference join_specification
+  | table_reference NATURAL [INNER | {LEFT|RIGHT} [OUTER]] JOIN table_factor
+}
+
+join_specification: {
+    ON search_condition
+  | USING (join_column_list)
+}
+
+join_column_list:
+    column_name [, column_name] ...
+*/
+
 JoinTable:
 	/* Use %prec to evaluate production TableRef before cross join */
 	TableRef CrossOpt TableRef %prec tableRefPriority
@@ -3810,6 +3826,12 @@ JoinTable:
 		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $3.(ast.ResultSetNode), Tp: ast.CrossJoin}
 	}
 	/* Your code here. */
+|
+	TableRef JoinType OuterOpt "JOIN" TableRef "ON" Expression %prec tableRefPriority
+	{
+		on := &ast.OnCondition {Expr: $7}
+		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $5.(ast.ResultSetNode), Tp: $2.(ast.JoinType), On: on}
+	}
 
 JoinType:
 	"LEFT"

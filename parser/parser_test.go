@@ -34,6 +34,35 @@ func TestT(t *testing.T) {
 	TestingT(t)
 }
 
+type visitor struct{}
+
+func (v *visitor) Enter(in ast.Node) (out ast.Node, skipChildren bool) {
+	fmt.Printf("%T\n", in)
+	return in, false
+}
+
+func (v *visitor) Leave(in ast.Node) (out ast.Node, ok bool) {
+	return in, true
+}
+
+func TestMyTest(t *testing.T) {
+	p := parser.New()
+
+	sql := "select * from t1 right join t2 on t1.id = t2.id left join t3 on t3.id = t2.id"
+	stmtNodes, _, err := p.Parse(sql, "", "")
+
+	if err != nil {
+		fmt.Printf("parse error:\n%v\n%s", err, sql)
+		return
+	}
+	for _, stmtNode := range stmtNodes {
+		v := visitor{}
+		stmtNode.Accept(&v)
+	}
+
+	fmt.Printf("%#v\n", stmtNodes[0])
+}
+
 var _ = Suite(&testParserSuite{})
 
 type testParserSuite struct {
