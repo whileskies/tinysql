@@ -495,7 +495,59 @@ func NewRulePushSelDownAggregation() Transformation {
 // or just keep the selection unchanged.
 func (r *PushSelDownAggregation) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the algo according to the header comment.
-	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
+	sel := old.GetExpr().ExprNode.(*plannercore.LogicalSelection)
+	aggr := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+	aggrSchema := old.Children[0].GetExpr().Schema()
+	childGroup := old.Children[0].GetExpr().Children[0]
+
+	aggrNoGroupBySchema := aggrSchema.Clone()
+	for _, col := range aggr.GetGroupByCols() {
+		idx := aggrNoGroupBySchema.ColumnIndex(col)
+		if idx != -1 {
+			aggrNoGroupBySchema.Columns = append(aggrNoGroupBySchema.Columns[:idx], aggrNoGroupBySchema.Columns[idx+1:]...)
+		}
+	}
+
+	canBePushed := make([]expression.Expression, 0, len(sel.Conditions))
+	canNotBePushed := make([]expression.Expression, 0, len(sel.Conditions))
+
+	for _, expr := range sel.Conditions {
+		exprColumns := expression.ExtractColumns(expr)
+		containCol := false
+		for _, exprCol := range exprColumns {
+			if aggrNoGroupBySchema.Contains(exprCol) {
+				containCol = true
+				break
+			}
+		}
+
+		if containCol {
+			canNotBePushed = append(canNotBePushed, expr)
+		} else {
+			canBePushed = append(canBePushed, expr)
+		}
+	}
+
+	if len(canBePushed) == 0 {
+		return nil, false, false, nil
+	}
+
+	newBottomSel := plannercore.LogicalSelection{Conditions: canBePushed}.Init(sel.SCtx())
+	newBottomSelExpr := memo.NewGroupExpr(newBottomSel)
+	newBottomSelExpr.SetChildren(childGroup)
+	newBottomSelGroup := memo.NewGroupWithSchema(newBottomSelExpr, childGroup.Prop.Schema)
+	newAggrExpr := memo.NewGroupExpr(aggr)
+	newAggrExpr.SetChildren(newBottomSelGroup)
+	if len(canNotBePushed) == 0 {
+		return []*memo.GroupExpr{newAggrExpr}, true, false, nil
+	}
+
+	newAggrGroup := memo.NewGroupWithSchema(newAggrExpr, aggrSchema)
+	newTopSel := plannercore.LogicalSelection{Conditions: canNotBePushed}.Init(sel.SCtx())
+	newTopSelExpr := memo.NewGroupExpr(newTopSel)
+	newTopSelExpr.SetChildren(newAggrGroup)
+
+	return []*memo.GroupExpr{newTopSelExpr}, true, false, nil
 }
 
 // TransformLimitToTopN transforms Limit+Sort to TopN.
@@ -798,5 +850,38 @@ func (r *MergeAggregationProjection) Match(old *memo.ExprIter) bool {
 // It will transform `Aggregation->Projection->X` to `Aggregation->X`.
 func (r *MergeAggregationProjection) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the body according to the header comment.
-	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
+	aggr := old.GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+	childGroup := old.Children[0].Group
+	child := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalProjection)
+
+	replace := make(map[string]*expression.Column)
+	for i, col := range childGroup.Prop.Schema.Columns {
+		if colOrigin, ok := child.Exprs[i].(*expression.Column); ok {
+			replace[string(col.HashCode(nil))] = colOrigin
+		}
+	}
+
+	newAggr := plannercore.LogicalAggregation{AggFuncs: make([]*aggregation.AggFuncDesc, len(aggr.AggFuncs)),
+		GroupByItems: make([]expression.Expression, len(aggr.GroupByItems))}.Init(aggr.SCtx())
+
+	for i, agg := range aggr.AggFuncs {
+		newAgg := agg.Clone()
+		for j, aggExpr := range agg.Args {
+			newAggExpr := aggExpr.Clone()
+			plannercore.ResolveExprAndReplace(newAggExpr, replace)
+			newAgg.Args[j] = plannercore.ReplaceColumnOfExpr(newAggExpr, child, childGroup.Prop.Schema)
+		}
+		newAggr.AggFuncs[i] = newAgg
+	}
+
+	for i, gbyItem := range aggr.GroupByItems {
+		newGByItem := gbyItem.Clone()
+		plannercore.ResolveExprAndReplace(newGByItem, replace)
+		newAggr.GroupByItems[i] = plannercore.ReplaceColumnOfExpr(newGByItem, child, childGroup.Prop.Schema)
+	}
+
+	newAggrExpr := memo.NewGroupExpr(newAggr)
+	newAggrExpr.SetChildren(old.Children[0].GetExpr().Children[0])
+
+	return []*memo.GroupExpr{newAggrExpr}, true, false, nil
 }
