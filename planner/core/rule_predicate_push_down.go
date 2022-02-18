@@ -359,28 +359,37 @@ func (la *LogicalAggregation) PredicatePushDown(predicates []expression.Expressi
 	canBePushed := make([]expression.Expression, 0, len(predicates))
 	canNotBePushed := make([]expression.Expression, 0, len(predicates))
 
-	aggrNoGroupBySchema := la.schema.Clone()
-	for _, col := range la.GetGroupByCols() {
-		idx := aggrNoGroupBySchema.ColumnIndex(col)
-		if idx != -1 {
-			aggrNoGroupBySchema.Columns = append(aggrNoGroupBySchema.Columns[:idx], aggrNoGroupBySchema.Columns[idx+1:]...)
-		}
+	originalExprs := make([]expression.Expression, 0, len(la.AggFuncs))
+	for _, fun := range la.AggFuncs {
+		originalExprs = append(originalExprs, fun.Args[0])
 	}
 
-	for _, expr := range predicates {
-		exprColumns := expression.ExtractColumns(expr)
-		containCol := false
-		for _, exprCol := range exprColumns {
-			if aggrNoGroupBySchema.Contains(exprCol) {
-				containCol = true
-				break
+	groupByColumns := expression.NewSchema(la.GetGroupByCols()...)
+	for _, cond := range predicates {
+		switch cond.(type) {
+		case *expression.Constant:
+			canBePushed = append(canBePushed, cond)
+			// Consider SQL list "select sum(b) from t group by a having 1=0". "1=0" is a constant predicate which should be
+			// retained and pushed down at the same time. Because we will get a wrong query result that contains one column
+			// with value 0 rather than an empty query result.
+			canNotBePushed = append(canNotBePushed, cond)
+		case *expression.ScalarFunction:
+			extractedCols := expression.ExtractColumns(cond)
+			ok := true
+			for _, col := range extractedCols {
+				if !groupByColumns.Contains(col) {
+					ok = false
+					break
+				}
 			}
-		}
-
-		if containCol {
-			canNotBePushed = append(canNotBePushed, expr)
-		} else {
-			canBePushed = append(canBePushed, expr)
+			if ok {
+				newFunc := expression.ColumnSubstitute(cond, la.Schema(), originalExprs)
+				canBePushed = append(canBePushed, newFunc)
+			} else {
+				canNotBePushed = append(canNotBePushed, cond)
+			}
+		default:
+			canNotBePushed = append(canNotBePushed, cond)
 		}
 	}
 

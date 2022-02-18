@@ -500,31 +500,34 @@ func (r *PushSelDownAggregation) OnTransform(old *memo.ExprIter) (newExprs []*me
 	aggrSchema := old.Children[0].GetExpr().Schema()
 	childGroup := old.Children[0].GetExpr().Children[0]
 
-	aggrNoGroupBySchema := aggrSchema.Clone()
-	for _, col := range aggr.GetGroupByCols() {
-		idx := aggrNoGroupBySchema.ColumnIndex(col)
-		if idx != -1 {
-			aggrNoGroupBySchema.Columns = append(aggrNoGroupBySchema.Columns[:idx], aggrNoGroupBySchema.Columns[idx+1:]...)
-		}
-	}
-
 	canBePushed := make([]expression.Expression, 0, len(sel.Conditions))
 	canNotBePushed := make([]expression.Expression, 0, len(sel.Conditions))
 
-	for _, expr := range sel.Conditions {
-		exprColumns := expression.ExtractColumns(expr)
-		containCol := false
-		for _, exprCol := range exprColumns {
-			if aggrNoGroupBySchema.Contains(exprCol) {
-				containCol = true
-				break
+	groupByColumns := expression.NewSchema(aggr.GetGroupByCols()...)
+	for _, cond := range sel.Conditions {
+		switch cond.(type) {
+		case *expression.Constant:
+			canBePushed = append(canBePushed, cond)
+			// Consider SQL list "select sum(b) from t group by a having 1=0". "1=0" is a constant predicate which should be
+			// retained and pushed down at the same time. Because we will get a wrong query result that contains one column
+			// with value 0 rather than an empty query result.
+			canNotBePushed = append(canNotBePushed, cond)
+		case *expression.ScalarFunction:
+			extractedCols := expression.ExtractColumns(cond)
+			ok := true
+			for _, col := range extractedCols {
+				if !groupByColumns.Contains(col) {
+					ok = false
+					break
+				}
 			}
-		}
-
-		if containCol {
-			canNotBePushed = append(canNotBePushed, expr)
-		} else {
-			canBePushed = append(canBePushed, expr)
+			if ok {
+				canBePushed = append(canBePushed, cond)
+			} else {
+				canNotBePushed = append(canNotBePushed, cond)
+			}
+		default:
+			canNotBePushed = append(canNotBePushed, cond)
 		}
 	}
 
@@ -851,15 +854,7 @@ func (r *MergeAggregationProjection) Match(old *memo.ExprIter) bool {
 func (r *MergeAggregationProjection) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the body according to the header comment.
 	aggr := old.GetExpr().ExprNode.(*plannercore.LogicalAggregation)
-	childGroup := old.Children[0].Group
 	child := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalProjection)
-
-	replace := make(map[string]*expression.Column)
-	for i, col := range childGroup.Prop.Schema.Columns {
-		if colOrigin, ok := child.Exprs[i].(*expression.Column); ok {
-			replace[string(col.HashCode(nil))] = colOrigin
-		}
-	}
 
 	newAggr := plannercore.LogicalAggregation{AggFuncs: make([]*aggregation.AggFuncDesc, len(aggr.AggFuncs)),
 		GroupByItems: make([]expression.Expression, len(aggr.GroupByItems))}.Init(aggr.SCtx())
@@ -868,20 +863,18 @@ func (r *MergeAggregationProjection) OnTransform(old *memo.ExprIter) (newExprs [
 		newAgg := agg.Clone()
 		for j, aggExpr := range agg.Args {
 			newAggExpr := aggExpr.Clone()
-			plannercore.ResolveExprAndReplace(newAggExpr, replace)
-			newAgg.Args[j] = plannercore.ReplaceColumnOfExpr(newAggExpr, child, childGroup.Prop.Schema)
+			newAgg.Args[j] = expression.ColumnSubstitute(newAggExpr, child.Schema(), child.Exprs)
 		}
 		newAggr.AggFuncs[i] = newAgg
 	}
 
 	for i, gbyItem := range aggr.GroupByItems {
 		newGByItem := gbyItem.Clone()
-		plannercore.ResolveExprAndReplace(newGByItem, replace)
-		newAggr.GroupByItems[i] = plannercore.ReplaceColumnOfExpr(newGByItem, child, childGroup.Prop.Schema)
+		newAggr.GroupByItems[i] = expression.ColumnSubstitute(newGByItem, child.Schema(), child.Exprs)
 	}
 
 	newAggrExpr := memo.NewGroupExpr(newAggr)
-	newAggrExpr.SetChildren(old.Children[0].GetExpr().Children[0])
+	newAggrExpr.SetChildren(old.Children[0].GetExpr().Children...)
 
 	return []*memo.GroupExpr{newAggrExpr}, true, false, nil
 }
